@@ -654,10 +654,10 @@ python3 checkin.py
 ### 青龙面板订阅
 
 ```bash
-ql repo https://github.com/smr8890/2026-glados-checkin.git "^checkin" "" "turnstile_solver|browser_checkin" "main" "py" "" "true" "true"
+ql repo https://github.com/smr8890/2026-glados-checkin.git "^checkin" "" "^(turnstile_solver|browser_checkin)" "" "py" "" "true" "true"
 ```
 
-白名单只匹配 `checkin.py`，`turnstile_solver.py` 和 `browser_checkin.py` 通过依赖文件复制，不会创建额外定时任务。
+白名单只匹配根目录的 `checkin.py`；依赖文件只复制根目录的 `turnstile_solver.py` 和 `browser_checkin.py`，不会复制 `tests/test_turnstile_solver.py`，也不会创建额外定时任务。
 
 ---
 
