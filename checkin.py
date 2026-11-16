@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 name: GLaDOS签到
-cron: 30 9 * * *
+cron: 2 4 * * *
 
 青龙面板：上面两行仅在订阅开启 AutoAddCron 时自动建任务；否则手动新建
 `task <路径>/checkin.py`，定时规则用同一 cron。cron 按面板时区执行，
