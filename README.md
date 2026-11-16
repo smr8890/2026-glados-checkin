@@ -237,6 +237,11 @@ GLaDOS 在 2026 年初进行了 API 更新，**绝大多数旧签到脚本已失
 | `EXCHANGE_PLAN`      | ❌ 否 | 积分自动兑换计划（#11）：`plan500`（默认，500 分自动兑换 100 天）、`plan200`（200 分→30 天）、`plan100`（100 分→10 天）或 `off`（关闭）。兑换结果即使 `PUSH_LEVEL=fail_only` 也会推送。 |
 | `GLADOS_BROWSER_CHECKIN` | ❌ 否 | Turnstile 真浏览器兜底开关：默认开启；`0` 关闭。检测到 `GITHUB_ACTIONS` 时默认自动禁用，设 `1` 可显式尝试（尚未验证 Actions 首次签到恢复）。 |
 | `GLADOS_BROWSER_HEADLESS` | ❌ 否 | 浏览器兜底改无头模式：默认 `0`（有头）；未验证不同环境的成功率。 |
+| `TWOCAPTCHA_API_KEY` | ❌ 否 | 2captcha API Key。配置后，签到会先用 2captcha 求解 challenge 下发的 Turnstile 令牌再提交；未配置则保持原逻辑。按次计费，不保证一定通过。 |
+| `TWOCAPTCHA_API_BASE` | ❌ 否 | 2captcha API 根地址，默认 `https://api.2captcha.com`。 |
+| `TWOCAPTCHA_TIMEOUT` | ❌ 否 | 单次 Turnstile 求解超时秒数，默认 `120`，并受 challenge TTL（约 300s）约束。 |
+
+配置 `TWOCAPTCHA_API_KEY` 后，单次签到流程为：取 challenge → 用 2captcha 求解 → 提交签到；若求解失败或服务端仍返回 `reason=turnstile`，再走现有真浏览器兜底（若未被禁用）。2captcha 使用 `TurnstileTaskProxyless`，任务参数直接取自 challenge：`websiteKey` 为 `turnstile` 字段、`action=checkin`、`data=nonce`；成功后才提交 `tsState=ok` 与 `turnstile` 令牌。求解失败时不会提交签到。
 
 PushPlus、Server酱和 Telegram 均为可选，可单独使用，也可同时配置；多个渠道配置后会分别发送同一份多账号汇总，并遵循同一个 `PUSH_LEVEL` 设置。只读诊断（`diagnose_only`）不发送推送。
 

@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+name: GLaDOS签到
+cron: 30 9 * * *
+
+青龙面板：上面两行仅在订阅开启 AutoAddCron 时自动建任务；否则手动新建
+`task <路径>/checkin.py`，定时规则用同一 cron。cron 按面板时区执行，
+容器为 UTC 时北京时间 09:30 对应 `30 1 * * *`。
+青龙只需安装 requests；浏览器兜底默认关闭，如需启用请设置
+GLADOS_BROWSER_CHECKIN=1。
+
 2026 GLaDOS 自动签到 (积分增强版)
 
 功能：
@@ -14,6 +23,7 @@
 
 import html
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -21,9 +31,23 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
+from urllib.parse import quote_plus, urlencode, urlsplit
 
 import requests
+
+try:
+    from turnstile_solver import solve_turnstile, turnstile_solver_enabled
+except ImportError:  # pragma: no cover - 可选模块缺失时不阻断原有签到
+    def turnstile_solver_enabled():
+        return False
+
+    def solve_turnstile(*args, **kwargs):
+        return {
+            'request_failed': True,
+            'reason': 'turnstile-solver-failed',
+            'detail': 'unavailable',
+            'fatal': True,
+        }
 
 # Fix Windows Unicode Output
 if sys.platform.startswith('win'):
@@ -63,6 +87,13 @@ NORMAL_CHECKIN_MESSAGES = (
 # and sends SHA-256(nonce + ".glados-observe-v1") with the check-in request.
 # Allow a small margin beyond that minimum, as in the reference script in #28.
 CHECKIN_CHALLENGE_DELAY = 2.7
+
+# 配置 TWOCAPTCHA_API_KEY 后，签到前先调用 2captcha 解 Turnstile：
+# challenge 里的 turnstile 字段即 sitekey，页面以 action="checkin"、
+# cData=nonce 渲染。官方前端要求在 ttl - 15s 前提交，这里预留同样边界。
+CHECKIN_PAGE_PATH = '/console/checkin'
+TURNSTILE_TTL_MARGIN = 15.0
+TURNSTILE_SOLVE_TIMEOUT = 120.0
 
 # 积分兑换计划 (#11)：消耗 points 积分兑换 days 天会员。
 # 通过环境变量 EXCHANGE_PLAN 选择，默认 plan500（500 分兑换 100 天），
@@ -336,6 +367,8 @@ def summarize_checkin_failure(result):
         label = '未获取有效签到验证，本次未提交签到，请稍后重试'
     elif reason == 'checkin-challenge-expired':
         label = '签到验证已过期，本次未提交签到，请稍后重试'
+    elif result.get('solver_failed') is True:
+        label = '2captcha 未能提供 Turnstile 令牌，本次未提交签到；请检查 API Key 与余额后重试'
     elif result.get('request_failed') is True:
         if result.get('invalid_headers') is True:
             label = '请求头格式无效，请检查 Cookie 和 User-Agent 格式'
@@ -463,19 +496,21 @@ def summarize_current_run_gain(result, is_success, client):
     return claim + '；已读取流水中未识别到今日正变动（不等于没有入账，记录可能缺失或延迟）'
 
 
+def browser_checkin_enabled():
+    """浏览器兜底默认关闭，仅显式设置为真值时启用。"""
+    return os.environ.get('GLADOS_BROWSER_CHECKIN', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
 def attempt_browser_checkin(client, max_attempts=2):
     """Turnstile 兜底：真浏览器打开官方签到页完成验证并签到。
 
     返回浏览器签到结果 dict；返回 None 表示兜底被禁用或环境不可用。
     任何异常都不应中断主流程，最终失败按 turnstile 原语义处理。
     """
-    if os.environ.get('GLADOS_BROWSER_CHECKIN', '1').strip().lower() in ('0', 'false', 'no', 'off'):
-        return None
-    # GitHub Actions 是数据中心 IP + 无头临时容器，Turnstile 基本不可能放行，
-    # 默认禁用以免浪费 runner 分钟数；确要尝试可显式设 GLADOS_BROWSER_CHECKIN=1。
-    if (os.environ.get('GITHUB_ACTIONS', '').strip().lower() in ('1', 'true', 'yes')
-            and os.environ.get('GLADOS_BROWSER_CHECKIN', '').strip().lower() not in ('1', 'true', 'yes', 'on')):
-        log("⏭️ 检测到 GitHub Actions 环境：浏览器兜底默认禁用（数据中心 IP 无法可靠通过 Turnstile，请转本地运行）")
+    if not browser_checkin_enabled():
+        # GitHub Actions 是数据中心 IP + 无头临时容器，Turnstile 基本不可能放行。
+        if os.environ.get('GITHUB_ACTIONS', '').strip().lower() in ('1', 'true', 'yes'):
+            log("⏭️ 检测到 GitHub Actions 环境：浏览器兜底未启用（数据中心 IP 无法可靠通过 Turnstile，请转本地运行；如确需尝试请设置 GLADOS_BROWSER_CHECKIN=1）")
         return None
     try:
         from browser_checkin import browser_checkin
@@ -706,7 +741,7 @@ class GLaDOS:
         return False
 
     def checkin(self):
-        """执行签到"""
+        """执行签到；配置 2captcha 时先求解 challenge 下发的 Turnstile。"""
         challenge = self.req('GET', '/api/user/checkin/challenge')
         if is_non_retryable_checkin_result(challenge) or is_missing_api_response(challenge):
             return challenge
@@ -721,19 +756,81 @@ class GLaDOS:
         ):
             return {'request_failed': True, 'reason': 'checkin-challenge-unavailable'}
 
+        # challenge 的 turnstile 字段就是挂件 sitekey；非字符串/空值视为未启用。
+        sitekey = challenge.get('turnstile')
+        if not isinstance(sitekey, str) or not sitekey.strip() or len(sitekey) > 4096:
+            sitekey = None
+        else:
+            sitekey = sitekey.strip()
+
         # A nonce belongs to the origin which issued it. Do not replay the POST
         # on another domain; the outer retry obtains a fresh challenge instead.
         domain = self.domain
         received_at = time.monotonic()
         proof = hashlib.sha256((nonce + '.glados-observe-v1').encode('utf-8')).hexdigest()
+
+        turnstile_token = None
+        solver_failure = None
+        solver_attempted = bool(sitekey and turnstile_solver_enabled())
+        if solver_attempted:
+            # 令牌必须在 challenge TTL 内取得并提交；预留官方前端同样的 15s 边界。
+            remaining = ttl / 1000.0 - (time.monotonic() - received_at) - TURNSTILE_TTL_MARGIN
+            solve_timeout = min(TURNSTILE_SOLVE_TIMEOUT, remaining)
+            if solve_timeout > 0:
+                try:
+                    solved = solve_turnstile(
+                        sitekey=sitekey,
+                        page_url=domain + CHECKIN_PAGE_PATH,
+                        action='checkin',
+                        cdata=nonce,
+                        timeout=solve_timeout,
+                    )
+                except Exception as error:  # noqa: BLE001 - 求解失败必须降级到浏览器兜底
+                    solved = {
+                        'request_failed': True,
+                        'reason': 'turnstile-solver-failed',
+                        'detail': type(error).__name__,
+                        'fatal': False,
+                    }
+                if solved.get('token'):
+                    turnstile_token = solved['token']
+                    log("✅ 2captcha 已返回 Turnstile 令牌")
+                else:
+                    solver_failure = solved
+            else:
+                solver_failure = {
+                    'request_failed': True,
+                    'reason': 'turnstile-solver-failed',
+                    'detail': 'timeout-budget',
+                    'fatal': False,
+                }
+
         time.sleep(CHECKIN_CHALLENGE_DELAY)
         if (time.monotonic() - received_at) * 1000 >= ttl:
             return {'request_failed': True, 'reason': 'checkin-challenge-expired'}
-        return self.req('POST', '/api/user/checkin', {
+
+        body = {
             'token': urlsplit(domain).hostname,
             'nonce': nonce,
             'proof': proof,
-        }, domains=(domain,))
+        }
+        if solver_attempted:
+            # 与官方前端一致：token 为单次、与 nonce(cData) 绑定。
+            body['tsState'] = 'ok' if turnstile_token else 'timeout'
+            if turnstile_token:
+                body['turnstile'] = turnstile_token
+
+        if solver_failure is not None:
+            detail = solver_failure.get('detail', 'unknown')
+            log(f"⚠️ 2captcha 未能提供 Turnstile 令牌（{detail}），本次不提交签到")
+            return {
+                'request_failed': True,
+                'reason': 'turnstile',
+                'solver_failed': True,
+                'detail': detail,
+            }
+
+        return self.req('POST', '/api/user/checkin', body, domains=(domain,))
 
     def exchange(self, plan):
         """兑换会员天数：表单提交 planType (plan100/plan200/plan500)"""
@@ -800,6 +897,15 @@ def pushplus(token, title, content):
         log(f"❌ PushPlus 推送失败: {e}")
         return False
 
+def html_to_plain_text(content):
+    """Convert the HTML report used by notifications into readable plain text."""
+    text = re.sub(r"<br\s*/?>", "\n", content or "", flags=re.IGNORECASE)
+    text = re.sub(r"</(?:h[1-6]|p|div)\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    lines = [line.strip() for line in html.unescape(text).splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
 def serverchan_push(sendkey, title, content):
     """发送 Server酱通知，兼容 Turbo 与 Server酱³ SendKey。"""
     sendkey = (sendkey or "").strip()
@@ -818,11 +924,7 @@ def serverchan_push(sendkey, title, content):
         url = f"https://sctapi.ftqq.com/{sendkey}.send"
 
     # 复用完整的多账号报告；先去标签再解码，保留正文里的 HTML 转义字符。
-    text = re.sub(r"<br\s*/?>", "\n", content, flags=re.IGNORECASE)
-    text = re.sub(r"</(?:h[1-6]|p|div)\s*>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", "", text)
-    lines = [line.strip() for line in html.unescape(text).splitlines()]
-    desp = "  \n".join(line for line in lines if line)
+    desp = "  \n".join(html_to_plain_text(content).splitlines())
 
     try:
         response = requests.post(url, json={'title': title, 'desp': desp}, timeout=10)
@@ -888,6 +990,225 @@ def telegram_push(token, chat_id, title, content):
         log(f"❌ Telegram 推送失败: {e}")
         return False
 
+WEBHOOK_PLACEHOLDERS = ("$title", "$content_text", "$content")
+
+
+def parse_webhook_headers(raw_headers):
+    """Parse `Key: Value` lines (or a JSON object) into a request header dict."""
+    raw_headers = (raw_headers or "").strip()
+    if not raw_headers:
+        return {}
+
+    if raw_headers.startswith("{"):
+        try:
+            parsed = json.loads(raw_headers)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return {str(key): str(value) for key, value in parsed.items()}
+
+    headers = {}
+    for line in re.split(r"\r?\n", raw_headers):
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key:
+            headers[key] = value.strip()
+    return headers
+
+
+def _replace_webhook_placeholders(value, placeholders):
+    if isinstance(value, str):
+        for name, replacement in placeholders.items():
+            value = value.replace(name, replacement)
+        return value
+    if isinstance(value, list):
+        return [_replace_webhook_placeholders(item, placeholders) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_webhook_placeholders(item, placeholders)
+            for key, item in value.items()
+        }
+    return value
+
+
+def render_webhook_body(template, title, content, content_type):
+    """Fill $title/$content/$content_text and keep the payload valid per content type."""
+    content_type = (content_type or "application/json").split(";", 1)[0].strip().lower()
+    text = html_to_plain_text(content)
+
+    if content_type == "application/json":
+        if not (template or "").strip():
+            return json.dumps({"title": title, "content": text}, ensure_ascii=False).encode("utf-8")
+
+        placeholders = {"$title": title, "$content_text": text, "$content": content}
+        try:
+            parsed = json.loads(template)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            rendered = _replace_webhook_placeholders(parsed, placeholders)
+            return json.dumps(rendered, ensure_ascii=False).encode("utf-8")
+
+        # Invalid JSON template: still escape substituted values so quotes and
+        # newlines cannot break the request body.
+        for name, value in placeholders.items():
+            template = template.replace(name, json.dumps(value, ensure_ascii=False)[1:-1])
+        return template.encode("utf-8")
+
+    if content_type == "application/x-www-form-urlencoded":
+        if not (template or "").strip():
+            return urlencode({"title": title, "content": text}).encode("utf-8")
+        placeholders = {
+            "$title": quote_plus(title),
+            "$content_text": quote_plus(text),
+            "$content": quote_plus(content),
+        }
+        for name, value in placeholders.items():
+            template = template.replace(name, value)
+        return template.encode("utf-8")
+
+    if not (template or "").strip():
+        template = f"{title}\n\n{text}"
+    placeholders = {"$title": title, "$content_text": text, "$content": content}
+    for name, value in placeholders.items():
+        template = template.replace(name, value)
+    return template.encode("utf-8")
+
+
+def webhook_push(title, content, url=None, method=None, content_type=None,
+                 headers=None, body=None):
+    """Send a notification to the configured GLADOS_WEBHOOK_* endpoint."""
+    url = (url if url is not None else os.environ.get("GLADOS_WEBHOOK_URL", "")).strip()
+    if not url:
+        return False
+
+    method = (
+        method if method is not None else os.environ.get("GLADOS_WEBHOOK_METHOD", "")
+    ).strip().upper() or "POST"
+    content_type = (
+        content_type if content_type is not None
+        else os.environ.get("GLADOS_WEBHOOK_CONTENT_TYPE", "")
+    ).strip() or "application/json"
+    raw_headers = headers if headers is not None else os.environ.get("GLADOS_WEBHOOK_HEADERS", "")
+    body_template = body if body is not None else os.environ.get("GLADOS_WEBHOOK_BODY", "")
+
+    if body_template and not any(name in body_template for name in WEBHOOK_PLACEHOLDERS):
+        log("⚠️ Webhook 请求体未包含 $title/$content/$content_text 占位符，将发送固定内容")
+
+    # Keep secrets out of the URL in logs; only a type/status is reported.
+    try:
+        request_headers = parse_webhook_headers(raw_headers)
+        if not any(key.lower() == "content-type" for key in request_headers):
+            request_headers["Content-Type"] = content_type
+
+        payload = render_webhook_body(body_template, title, content, content_type)
+        formatted_url = url
+        for name, value in {
+            "$title": quote_plus(title),
+            "$content_text": quote_plus(html_to_plain_text(content)),
+            "$content": quote_plus(content),
+        }.items():
+            formatted_url = formatted_url.replace(name, value)
+
+        response = requests.request(
+            method=method,
+            url=formatted_url,
+            headers=request_headers,
+            data=payload,
+            timeout=10,
+        )
+        if response.status_code < 200 or response.status_code >= 300:
+            log(f"❌ Webhook 推送失败: HTTP {response.status_code}")
+            return False
+        log("✅ Webhook 推送成功")
+        return True
+    except (requests.RequestException, ValueError) as e:
+        log(f"❌ Webhook 推送失败: {type(e).__name__}")
+        return False
+
+
+def _load_qinglong_notify(path=None):
+    """Load Qinglong's sibling notify.py when present."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "notify.py")
+    if not os.path.isfile(path):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("_glados_qinglong_notify", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as e:  # noqa: BLE001 - 可选模块缺失或损坏时不影响主流程
+        log(f"⚠️ 青龙通知模块加载失败: {type(e).__name__}")
+        return None
+
+
+def qinglong_notify(title, content):
+    """Send through Qinglong's notify.py; return None when the channel is skipped."""
+    if os.environ.get("QINGLONG_NOTIFY", "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    module = _load_qinglong_notify()
+    if module is None:
+        return None
+
+    add_notify_function = getattr(module, "add_notify_function", None)
+    send = getattr(module, "send", None)
+    if not callable(add_notify_function) or not callable(send):
+        log("⚠️ 青龙通知模块缺少必要函数")
+        return False
+
+    try:
+        channels = add_notify_function()
+    except Exception as e:  # noqa: BLE001 - 通知失败不影响签到
+        log(f"⚠️ 青龙通知渠道检测失败: {type(e).__name__}")
+        return False
+    if not channels:
+        return None
+
+    try:
+        send(title, html_to_plain_text(content))
+        return True
+    except Exception as e:  # noqa: BLE001 - 通知失败不影响签到
+        log(f"⚠️ 青龙通知失败: {type(e).__name__}")
+        return False
+
+
+def send_notifications(title, content):
+    """Send to every configured channel and return (sent_any, ok)."""
+    sent_any = False
+    push_ok = True
+
+    ptoken = os.environ.get("PUSHPLUS_TOKEN")
+    serverchan_sendkey = os.environ.get("SERVERCHAN_SENDKEY", "").strip()
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    webhook_url = os.environ.get("GLADOS_WEBHOOK_URL", "").strip()
+
+    if ptoken:
+        sent_any = True
+        push_ok = pushplus(ptoken, title, content) and push_ok
+    if serverchan_sendkey:
+        sent_any = True
+        push_ok = serverchan_push(serverchan_sendkey, title, content) and push_ok
+    if tg_token and tg_chat_id:
+        sent_any = True
+        push_ok = bool(telegram_push(tg_token, tg_chat_id, title, content)) and push_ok
+    if webhook_url:
+        sent_any = True
+        push_ok = bool(webhook_push(title, content)) and push_ok
+
+    qinglong_result = qinglong_notify(title, content)
+    if qinglong_result is not None:
+        sent_any = True
+        if qinglong_result is False:
+            push_ok = False
+
+    return sent_any, push_ok
+
+
 def today_rewards_summary(client):
     """今日加分合计（流水口径）：当日全部正变动加总，明确标注含所有来源。"""
     total = getattr(client, 'today_rewards_total', None)
@@ -912,6 +1233,37 @@ def summarize_readonly_ledger(client, status_ok, points_ok):
     return '本次为只读核对（未发起签到请求）；已读取流水中未识别到今日正变动（不等于没有入账，今日可能尚未签到或记录延迟）'
 
 
+def mask_account(account):
+    """Mask an account for notifications, e.g. 2152918099@qq.com -> 21***9@qq.com."""
+    text = str(account or '')
+    if not text:
+        return text
+
+    local, separator, domain = text.partition('@')
+    if len(local) > 3:
+        masked = f'{local[:2]}***{local[-1]}'
+    else:
+        masked = f'{local[:1]}***'
+    return f'{masked}{separator}{domain}' if separator else masked
+
+
+def render_account_line(index, client, status_message):
+    """Render one compact notification line: 账号|签到结果|当前积分|剩余天数."""
+    account_label = mask_account(client.email) if client.email != '?' else f'账号 {index}'
+    points_label = str(client.points) if client.points != '?' else '未获取'
+    days_label = f'{client.left_days} 天' if client.left_days != '?' else '未获取'
+    return f"{account_label}|{status_message}|{points_label}|{days_label}"
+
+
+def get_notify_style():
+    """Return compact (default) or detailed notification layout."""
+    style = os.environ.get("NOTIFY_STYLE", "compact").strip().lower()
+    if style in ("compact", "detailed"):
+        return style
+    log(f"⚠️ NOTIFY_STYLE 值 '{style}' 无效 (可选: compact/detailed)，使用 compact")
+    return "compact"
+
+
 def render_account_card(
     index,
     client,
@@ -922,7 +1274,7 @@ def render_account_card(
     result_heading="签到结果",
 ):
     """Render per-account HTML card for PushPlus/ServerChan/Telegram notifications."""
-    account_label = str(client.email) if client.email != '?' else f'账号 {index}'
+    account_label = mask_account(client.email) if client.email != '?' else f'账号 {index}'
     points_label = str(client.points) if client.points != '?' else '未获取'
     change_time = (
         client.points_change_time
@@ -964,6 +1316,7 @@ def notify_status_accounts(cookies):
     if not log_user_agent_configuration():
         return 1
     exchange_plan = get_exchange_plan()
+    notify_style = get_notify_style()
     results = []
     success_cnt = 0
 
@@ -986,6 +1339,9 @@ def notify_status_accounts(cookies):
             f"{'✅' if query_ok else '❌'} 账号 {i} | 积分: {g.points} | 流水观察: {gain_summary} | "
             f"天数: {g.left_days} | 模式: {msg}"
         )
+        if notify_style == 'compact':
+            results.append(render_account_line(i, g, msg))
+            continue
         exchange_line = ""
         if exchange_plan:
             g.exchange_result = '⏭️ 只读核对模式，本次跳过自动兑换'
@@ -1001,28 +1357,19 @@ def notify_status_accounts(cookies):
             result_heading="运行模式",
         ))
 
-    ptoken = os.environ.get("PUSHPLUS_TOKEN")
-    serverchan_sendkey = os.environ.get("SERVERCHAN_SENDKEY", "").strip()
-    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-
-    if not (ptoken or serverchan_sendkey or (tg_token and tg_chat_id)):
-        log("⚠️ 未配置任何通知渠道（PUSHPLUS_TOKEN / SERVERCHAN_SENDKEY / TELEGRAM），无法发送状态推送")
-        return 1
-
     outcome = '只读核对完成' if success_cnt == len(cookies) else '只读核对异常'
     title = f"GLaDOS状态核对: {outcome} {success_cnt}/{len(cookies)}"
-    content = "".join(results)
-    content += '<p>说明：本次为只读状态与积分流水核对推送，未调用签到或兑换接口，不会触发 Turnstile 验证。</p>'
-    content += f"<br><small>时间（北京时间 UTC+8）: {beijing_time()}</small>"
+    if notify_style == 'compact':
+        content = "\n".join(results)
+    else:
+        content = "".join(results)
+        content += '<p>说明：本次为只读状态与积分流水核对推送，未调用签到或兑换接口，不会触发 Turnstile 验证。</p>'
+        content += f"<br><small>时间（北京时间 UTC+8）: {beijing_time()}</small>"
 
-    push_ok = True
-    if ptoken:
-        push_ok = pushplus(ptoken, title, content) and push_ok
-    if serverchan_sendkey:
-        push_ok = serverchan_push(serverchan_sendkey, title, content) and push_ok
-    if tg_token and tg_chat_id:
-        push_ok = bool(telegram_push(tg_token, tg_chat_id, title, content)) and push_ok
+    sent_any, push_ok = send_notifications(title, content)
+    if not sent_any:
+        log("⚠️ 未配置任何通知渠道（PUSHPLUS_TOKEN / SERVERCHAN_SENDKEY / TELEGRAM / GLADOS_WEBHOOK_URL / 青龙 notify.py），无法发送状态推送")
+        return 1
 
     return 0 if (success_cnt == len(cookies) and push_ok) else 1
 
@@ -1071,6 +1418,7 @@ def main():
     if not log_user_agent_configuration():
         return 1
     exchange_plan = get_exchange_plan()
+    notify_style = get_notify_style()
     if exchange_plan:
         plan = EXCHANGE_PLANS[exchange_plan]
         log(f"🎁 自动兑换已启用: {plan['points']}分 → {plan['days']}天 (EXCHANGE_PLAN={exchange_plan})")
@@ -1128,6 +1476,12 @@ def main():
             success_cnt += 1
 
         # 4. Result Formatting
+        if notify_style == 'compact':
+            result_message = msg
+            if g.exchange_result and not g.exchange_result.startswith("⏭️"):
+                result_message = f"{msg}；{g.exchange_result}"
+            results.append(render_account_line(i, g, result_message))
+            continue
         exchange_line = ""
         if exchange_plan:
             exchange_line = f"""
@@ -1143,25 +1497,17 @@ def main():
         log("⏭️ 根据 PUSH_LEVEL=fail_only 设置，所有账号签到成功，跳过推送")
         return 0
 
-    ptoken = os.environ.get("PUSHPLUS_TOKEN")
-    serverchan_sendkey = os.environ.get("SERVERCHAN_SENDKEY", "").strip()
-    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    
-    if ptoken or serverchan_sendkey or (tg_token and tg_chat_id):
-        outcome = '本次运行成功' if success_cnt == len(cookies) else '本次运行失败'
-        title = f"GLaDOS签到: {outcome} {success_cnt}/{len(cookies)}"
+    outcome = '本次运行成功' if success_cnt == len(cookies) else '本次运行失败'
+    title = f"GLaDOS签到: {outcome} {success_cnt}/{len(cookies)}"
+    if notify_style == 'compact':
+        content = "\n".join(results)
+    else:
         content = "".join(results)
         if success_cnt < len(cookies):
             content += '<p>以上仅反映本次运行。失败账号的今日签到状态未知，请结合当天其他成功运行或官网签到日历核对。</p>'
         content += f"<br><small>时间（北京时间 UTC+8）: {beijing_time()}</small>"
-        
-        if ptoken:
-            pushplus(ptoken, title, content)
-        if serverchan_sendkey:
-            serverchan_push(serverchan_sendkey, title, content)
-        if tg_token and tg_chat_id:
-            telegram_push(tg_token, tg_chat_id, title, content)
+
+    send_notifications(title, content)
 
     return 0 if success_cnt == len(cookies) else 1
 

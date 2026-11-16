@@ -16,6 +16,7 @@ class TransientFailureTests(unittest.TestCase):
                 'GLADOS_COOKIE': COOKIE,
                 'EXCHANGE_PLAN': 'plan500',
                 'CHECKIN_MAX_ATTEMPTS': '2',
+                'NOTIFY_STYLE': 'detailed',
                 'PUSHPLUS_TOKEN': 'private-push-token',
             }, clear=True),
             mock.patch('requests.sessions.Session.request',

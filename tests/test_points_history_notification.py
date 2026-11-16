@@ -57,6 +57,7 @@ class PointsHistoryTests(unittest.TestCase):
                     mock.patch.dict(os.environ, {'GLADOS_COOKIE': COOKIE,
                     'EXCHANGE_PLAN': 'off', 'CHECKIN_MAX_ATTEMPTS': '1',
                     'GLADOS_BROWSER_CHECKIN': '0',
+                    'NOTIFY_STYLE': 'detailed',
                     'PUSHPLUS_TOKEN': 'fake-token', 'PUSH_LEVEL': 'always'}, clear=True), \
                     mock.patch('checkin.GLaDOS', return_value=client), \
                     mock.patch('checkin.pushplus') as push, \
@@ -87,6 +88,7 @@ class PointsHistoryTests(unittest.TestCase):
         with mock.patch('checkin.beijing_now', return_value=FIXED_NOW), \
                 mock.patch.dict(os.environ, {
                     'GLADOS_COOKIE': COOKIE,
+                    'NOTIFY_STYLE': 'detailed',
                     'EXCHANGE_PLAN': 'plan500',
                     'CHECKIN_MAX_ATTEMPTS': '3',
                     'GLADOS_BROWSER_CHECKIN': '0',
@@ -173,6 +175,7 @@ class PointsHistoryTests(unittest.TestCase):
         with mock.patch('checkin.beijing_now', return_value=FIXED_NOW), \
                 mock.patch.dict(os.environ, {
                     'GLADOS_COOKIE': COOKIE,
+                    'NOTIFY_STYLE': 'detailed',
                     'EXCHANGE_PLAN': 'plan500',
                     'CHECKIN_MAX_ATTEMPTS': '1',
                     'PUSHPLUS_TOKEN': 'fake-token',
@@ -204,6 +207,7 @@ class PointsHistoryTests(unittest.TestCase):
                 mock.patch.dict(os.environ, {
                     'GLADOS_COOKIE': COOKIE,
                     'CHECKIN_NOTIFY_STATUS_ONLY': 'true',
+                    'NOTIFY_STYLE': 'detailed',
                     'EXCHANGE_PLAN': 'plan500',
                     'PUSH_LEVEL': 'fail_only',
                     'PUSHPLUS_TOKEN': 'fake-token',
@@ -221,7 +225,7 @@ class PointsHistoryTests(unittest.TestCase):
         title = push.call_args.args[1]
         content = push.call_args.args[2]
         self.assertIn('GLaDOS状态核对: 只读核对完成 1/1', title)
-        self.assertIn('readonly@example.test', content)
+        self.assertIn('re***y@example.test', content)
         self.assertIn('15', content)
         self.assertNotIn('(+14)', content)
         self.assertIn('本次为只读核对（未发起签到请求）', content)

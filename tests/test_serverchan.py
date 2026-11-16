@@ -157,6 +157,7 @@ class ServerChanMainTests(OfflineTestCase):
             'SERVERCHAN_SENDKEY': SENDKEY,
             'EXCHANGE_PLAN': 'off',
             'PUSH_LEVEL': 'all',
+            'NOTIFY_STYLE': 'detailed',
         }
         config.update(environment or {})
         with mock.patch.dict(os.environ, config, clear=True), \
@@ -176,7 +177,8 @@ class ServerChanMainTests(OfflineTestCase):
         key, title, body = serverchan.call_args.args
         self.assertEqual(key, SENDKEY)
         self.assertEqual(title, 'GLaDOS签到: 本次运行成功 1/1')
-        self.assertIn('synthetic@example.test', body)
+        self.assertIn('sy***c@example.test', body)
+        self.assertNotIn('synthetic@example.test', body)
         self.assertIn('500', body)
         self.assertIn('99', body)
         self.assertIn('时间（北京时间 UTC+8）:', body)

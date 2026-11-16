@@ -39,7 +39,7 @@ class BrowserFallbackTests(OfflineTestCase):
 
     def test_turnstile_triggers_browser_fallback_success(self):
         client = self.make_client(TURNSTILE)
-        with mock.patch.dict(os.environ, dict(PLAIN_ENV)), \
+        with mock.patch.dict(os.environ, dict(PLAIN_ENV, GLADOS_BROWSER_CHECKIN='1')), \
                 mock.patch('browser_checkin.browser_checkin', return_value=dict(OK)) as bc, \
                 mock.patch('checkin.log'):
             result, success = checkin.checkin_with_retry(client, 3, 0)
@@ -52,7 +52,7 @@ class BrowserFallbackTests(OfflineTestCase):
 
     def test_turnstile_browser_fallback_still_turnstile_reports_failure(self):
         client = self.make_client(TURNSTILE)
-        with mock.patch.dict(os.environ, dict(PLAIN_ENV)), \
+        with mock.patch.dict(os.environ, dict(PLAIN_ENV, GLADOS_BROWSER_CHECKIN='1')), \
                 mock.patch('browser_checkin.browser_checkin', return_value=dict(TURNSTILE)), \
                 mock.patch('checkin.time.sleep'), \
                 mock.patch('checkin.log'):
@@ -62,7 +62,7 @@ class BrowserFallbackTests(OfflineTestCase):
 
     def test_browser_exception_is_contained_as_failure(self):
         client = self.make_client(TURNSTILE)
-        with mock.patch.dict(os.environ, dict(PLAIN_ENV)), \
+        with mock.patch.dict(os.environ, dict(PLAIN_ENV, GLADOS_BROWSER_CHECKIN='1')), \
                 mock.patch('browser_checkin.browser_checkin',
                            side_effect=RuntimeError('boom')), \
                 mock.patch('checkin.time.sleep'), \
@@ -70,6 +70,17 @@ class BrowserFallbackTests(OfflineTestCase):
             result, success = checkin.checkin_with_retry(client, 3, 0)
         self.assertFalse(success)
         self.assertTrue(result.get('request_failed'))
+
+    def test_browser_fallback_is_disabled_by_default(self):
+        client = self.make_client(TURNSTILE)
+        with mock.patch.dict(os.environ, dict(PLAIN_ENV), clear=True), \
+                mock.patch('browser_checkin.browser_checkin') as bc, \
+                mock.patch('checkin.log'):
+            result, success = checkin.checkin_with_retry(client, 3, 0)
+        self.assertFalse(success)
+        self.assertEqual(result, TURNSTILE)
+        bc.assert_not_called()
+        client.checkin.assert_called_once()
 
     def test_env_disable_keeps_legacy_stop_behavior(self):
         client = self.make_client(TURNSTILE)

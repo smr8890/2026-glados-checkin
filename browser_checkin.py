@@ -12,7 +12,7 @@
   注入 Cookie -> 点 "Check in" 按钮 -> 拦截 /api/user/checkin 的 JSON 响应。
 
 设计说明：
-  - 浏览器持久化目录放在系统用户数据区（LOCALAPPDATA），不落在仓库内，
+  - 浏览器持久化目录为仓库内的 browser_profile/（已在 .gitignore 中忽略），
     避免登录态被误提交；目录保存 cf_clearance 等状态，请勿随意删除。
   - 默认使用浏览器原生 UA（与 Sec-CH-UA 一致，Turnstile 通过率最高）；
     若服务端返回 device-mismatch，再用 cookie.txt 配套 UA 重试一次。
@@ -48,9 +48,8 @@ def _log(msg):
 
 
 def profile_dir():
-    """浏览器持久化目录：放在系统用户数据区，避免落入 git 仓库。"""
-    base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
-    return os.path.join(base, 'glados-checkin-browser')
+    """浏览器持久化目录：位于仓库内 browser_profile/，已由 .gitignore 忽略。"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'browser_profile')
 
 
 def parse_cookie_header(cookie_header, base_url):
