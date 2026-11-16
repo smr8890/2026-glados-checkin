@@ -651,6 +651,14 @@ python3 checkin.py
 30 9 * * * export GLADOS_COOKIE="gld:sess=xxx; gld:sess.sig=yyy"; cd /path/to/2026-glados-checkin && python3 checkin.py >> glados.log 2>&1
 ```
 
+### 青龙面板订阅
+
+```bash
+ql repo https://github.com/smr8890/2026-glados-checkin.git "^checkin" "" "turnstile_solver|browser_checkin" "main" "py" "" "true" "true"
+```
+
+白名单只匹配 `checkin.py`，`turnstile_solver.py` 和 `browser_checkin.py` 通过依赖文件复制，不会创建额外定时任务。
+
 ---
 
 ## ❄️ NixOS 服务配置
