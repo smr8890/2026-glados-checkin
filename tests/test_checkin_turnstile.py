@@ -148,7 +148,7 @@ class TurnstileCheckinTests(unittest.TestCase):
             'proof': PROOF,
         })
 
-    def test_solver_failure_triggers_browser_fallback_chain(self):
+    def test_solver_failure_triggers_manual_browser_handoff(self):
         client = checkin.GLaDOS(COOKIE)
         solver_failure = {
             'request_failed': True,
@@ -157,9 +157,10 @@ class TurnstileCheckinTests(unittest.TestCase):
             'detail': 'ERROR_ZERO_BALANCE',
         }
         client.checkin = mock.Mock(return_value=solver_failure)
+        client.get_status = mock.Mock(return_value=True)
         with mock.patch.dict(os.environ, {
             'GITHUB_ACTIONS': 'false',
-            'GLADOS_BROWSER_CHECKIN': '1',
+            'GLADOS_MANUAL_BROWSER': '1',
             'GLADOS_USER_AGENT': 'SyntheticBrowser/1.0',
         }), mock.patch('browser_checkin.browser_checkin', return_value=dict(OK)) as bc, \
                 mock.patch('checkin.log'):
@@ -168,6 +169,7 @@ class TurnstileCheckinTests(unittest.TestCase):
         self.assertTrue(success)
         self.assertEqual(result, OK)
         bc.assert_called_once()
+        self.assertEqual(bc.call_args.args[0], COOKIE)
 
 
 if __name__ == '__main__':
